@@ -3,13 +3,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve, auc, roc_curve, roc_auc_score
-from xgboost import XGBClassifier
-import xgboost as xgb
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve, roc_curve, roc_auc_score
+from sklearn.ensemble import RandomForestClassifier
 import json
 from datetime import datetime
 import os
 import warnings
+import gc  # Garbage collector
 
 # Import the analysis and splitting function
 from data_analysis_script import analyze_and_split_data
@@ -22,9 +22,10 @@ np.random.seed(42)
 
 def run_fraud_detection(data_file='smart_split_data.csv', 
                         output_dir='fraud_detection_results',
-                        use_existing_split=True):
+                        use_existing_split=True,
+                        sample_size=None):  # Optional sampling for very large datasets
     """
-    Run the complete fraud detection model pipeline
+    Run the optimized fraud detection model pipeline using RandomForest
     
     Parameters:
     -----------
@@ -34,6 +35,8 @@ def run_fraud_detection(data_file='smart_split_data.csv',
         Directory to save results and plots
     use_existing_split : bool
         Whether to use the existing train/test split in the data
+    sample_size : int or None
+        If provided, will use a random sample of this size for training
     """
     print(f"{'='*50}\nSTART FRAUD DETECTION MODEL\n{'='*50}")
     
@@ -43,13 +46,26 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     
     # 1. Load data
     print(f"\n[1] Loading data from {data_file}...")
+    
+    # For very large datasets, consider using chunking
     df = pd.read_csv(data_file)
     print(f"Loaded {len(df):,} transactions")
     
-    # Check for fraud column and rename if necessary
-    if 'Is Fraud?' in df.columns:
-        print("Renaming 'Is Fraud?' column to 'Is_Fraud'")
-        df.rename(columns={'Is Fraud?': 'Is_Fraud'}, inplace=True)
+    # Check for fraud column and ensure proper name
+    if 'is_fraud' not in df.columns:
+        if 'Is Fraud?' in df.columns:
+            print("Renaming 'Is Fraud?' column to 'is_fraud'")
+            df['is_fraud'] = df['Is Fraud?'].astype(int)
+        elif 'Is_Fraud' in df.columns:
+            print("Renaming 'Is_Fraud' column to 'is_fraud'")
+            df['is_fraud'] = df['Is_Fraud'].astype(int)
+        else:
+            fraud_columns = [col for col in df.columns if 'fraud' in col.lower()]
+            if fraud_columns:
+                print(f"Using {fraud_columns[0]} as fraud indicator")
+                df['is_fraud'] = df[fraud_columns[0]].astype(int)
+            else:
+                raise ValueError("No fraud column found in the dataset")
     
     # Check for split column if using existing split
     if use_existing_split:
@@ -67,7 +83,6 @@ def run_fraud_detection(data_file='smart_split_data.csv',
             
             if len(split_values) == 2:
                 # Determine which value corresponds to train
-                # Common patterns: train/test, 1/0, True/False
                 train_indicators = ['train', '1', 1, 'tr', True, 'true']
                 
                 for val in split_values:
@@ -75,13 +90,13 @@ def run_fraud_detection(data_file='smart_split_data.csv',
                         train_value = val
                         break
                 else:
-                    # If no match found, default to first value
+                    # Default to first value
                     train_value = split_values[0]
                     print(f"Could not determine train value, defaulting to: {train_value}")
                 
                 # Split the data
-                train_df = df[df[split_col] == train_value]
-                test_df = df[df[split_col] != train_value]
+                train_df = df[df[split_col] == train_value].copy()
+                test_df = df[df[split_col] != train_value].copy()
                 
                 print(f"Train set: {len(train_df):,} transactions")
                 print(f"Test set: {len(test_df):,} transactions")
@@ -95,44 +110,78 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     # Create a new split if needed
     if not use_existing_split:
         print("\nCreating new user-based train/test split")
-        # Sort by time if available
-        if 'Time' in df.columns:
-            df['Time'] = pd.to_datetime(df['Time'])
-            df = df.sort_values(['User', 'Time'])
-        
         # Split users, not transactions
         users = df['User'].unique()
         np.random.shuffle(users)
         train_users = users[:int(len(users) * 0.7)]  # 70% for training
         test_users = users[int(len(users) * 0.7):]   # 30% for testing
         
-        train_df = df[df['User'].isin(train_users)]
-        test_df = df[df['User'].isin(test_users)]
+        train_df = df[df['User'].isin(train_users)].copy()
+        test_df = df[df['User'].isin(test_users)].copy()
         
         print(f"Train set: {len(train_df):,} transactions ({len(train_df)/len(df)*100:.1f}%)")
         print(f"Test set: {len(test_df):,} transactions ({len(test_df)/len(df)*100:.1f}%)")
     
-    # 2. Data preprocessing
-    print("\n[2] Preprocessing data...")
+    # Free up memory
+    del df
+    gc.collect()
     
+    # Sample if needed for very large datasets
+    if sample_size is not None and sample_size < len(train_df):
+        print(f"\nSampling {sample_size:,} rows from training set for model building...")
+        
+        # Make sure we include enough fraud cases
+        fraud_train = train_df[train_df['is_fraud'] == 1]
+        non_fraud_train = train_df[train_df['is_fraud'] == 0]
+        
+        # Keep all fraud or sample if too many
+        if len(fraud_train) > sample_size // 10:
+            fraud_sample = fraud_train.sample(sample_size // 10, random_state=42)
+        else:
+            fraud_sample = fraud_train
+            
+        # Sample remaining from non-fraud
+        non_fraud_sample_size = min(sample_size - len(fraud_sample), len(non_fraud_train))
+        non_fraud_sample = non_fraud_train.sample(non_fraud_sample_size, random_state=42)
+        
+        # Combine and shuffle
+        train_df_sampled = pd.concat([fraud_sample, non_fraud_sample])
+        train_df_sampled = train_df_sampled.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+        print(f"Sampled training set: {len(train_df_sampled):,} transactions with {len(fraud_sample):,} fraud cases")
+        train_df = train_df_sampled
+    
+    # 2. Data preprocessing and feature engineering (combined for efficiency)
+    print("\n[2] Preprocessing data and engineering features...")
+    
+    # ---------- Numeric features ----------
     # Convert amount to numeric if needed
-    if 'Amount' in df.columns and not pd.api.types.is_numeric_dtype(df['Amount']):
-        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+    if 'Amount' in train_df.columns and not pd.api.types.is_numeric_dtype(train_df['Amount']):
         train_df['Amount'] = pd.to_numeric(train_df['Amount'], errors='coerce')
         test_df['Amount'] = pd.to_numeric(test_df['Amount'], errors='coerce')
     
-    # Create log transformed amount
+    # Log transform amount - useful for skewed monetary values
     train_df['amount_log'] = np.log1p(train_df['Amount'])
     test_df['amount_log'] = np.log1p(test_df['Amount'])
     
+    # ---------- Time-based features ----------
     # Extract hour from transaction time if available
     if 'Time' in train_df.columns:
         if not pd.api.types.is_datetime64_dtype(train_df['Time']):
-            train_df['Time'] = pd.to_datetime(train_df['Time'])
-            test_df['Time'] = pd.to_datetime(test_df['Time'])
+            train_df['Time'] = pd.to_datetime(train_df['Time'], errors='coerce')
+            test_df['Time'] = pd.to_datetime(test_df['Time'], errors='coerce')
         
+        # Extract hour
         train_df['hour'] = train_df['Time'].dt.hour
         test_df['hour'] = test_df['Time'].dt.hour
+        
+        # Day of week (0=Monday, 6=Sunday)
+        train_df['day_of_week'] = train_df['Time'].dt.dayofweek
+        test_df['day_of_week'] = test_df['Time'].dt.dayofweek
+        
+        # Is weekend
+        train_df['is_weekend'] = (train_df['day_of_week'] >= 5).astype(int)
+        test_df['is_weekend'] = (test_df['day_of_week'] >= 5).astype(int)
     elif 'transaction_hour' in train_df.columns:
         train_df['hour'] = train_df['transaction_hour']
         test_df['hour'] = test_df['transaction_hour']
@@ -142,167 +191,181 @@ def run_fraud_detection(data_file='smart_split_data.csv',
         test_df['hour'] = 0
         print("Warning: No time information found. Using placeholder hour value.")
     
-    # 3. Feature Engineering
-    print("\n[3] Engineering features...")
-    
-    # Check for required columns and adapt
-    required_columns = ['MCC', 'Merchant', 'Location', 'Transaction_ID']
-    missing_columns = [col for col in required_columns if col not in train_df.columns]
-    
-    if missing_columns:
-        print(f"Warning: Missing required columns: {missing_columns}")
-        print("Adapting feature engineering to available columns...")
+    # ---------- MCC-based features ----------
+    if 'MCC' in train_df.columns:
+        # MCC risk score - mean transaction amount per MCC
+        mcc_stats = train_df.groupby('MCC')['Amount'].agg(['mean', 'std', 'count']).reset_index()
+        mcc_stats.columns = ['MCC', 'mcc_avg_amount', 'mcc_std_amount', 'mcc_count']
         
-        # Map column names if alternatives exist
-        column_alternatives = {
-            'MCC': ['Merchant Category', 'Category', 'MerchantCategory'],
-            'Merchant': ['Merchant Name', 'MerchantName', 'Vendor'],
-            'Location': ['Merchant City', 'City', 'MerchantCity'],
-            'Transaction_ID': ['Transaction ID', 'TransactionID', 'ID']
-        }
+        # Convert to dictionaries for faster mapping
+        mcc_avg_dict = dict(zip(mcc_stats['MCC'], mcc_stats['mcc_avg_amount']))
+        mcc_std_dict = dict(zip(mcc_stats['MCC'], mcc_stats['mcc_std_amount']))
+        mcc_count_dict = dict(zip(mcc_stats['MCC'], mcc_stats['mcc_count']))
         
-        for missing_col in missing_columns:
-            alternatives = column_alternatives.get(missing_col, [])
-            found = False
+        # Apply mappings
+        train_df['mcc_avg_amount'] = train_df['MCC'].map(mcc_avg_dict)
+        test_df['mcc_avg_amount'] = test_df['MCC'].map(mcc_avg_dict)
+        
+        train_df['mcc_count'] = train_df['MCC'].map(mcc_count_dict)
+        test_df['mcc_count'] = test_df['MCC'].map(mcc_count_dict)
+        
+        # Fraud rate by MCC
+        if 'is_fraud' in train_df.columns:
+            mcc_fraud = train_df.groupby('MCC')['is_fraud'].mean().reset_index()
+            mcc_fraud.columns = ['MCC', 'mcc_fraud_rate']
+            mcc_fraud_dict = dict(zip(mcc_fraud['MCC'], mcc_fraud['mcc_fraud_rate']))
             
-            for alt in alternatives:
-                if alt in train_df.columns:
-                    print(f"Using '{alt}' as alternative for '{missing_col}'")
-                    # Create a copy with the expected column name
-                    train_df[missing_col] = train_df[alt]
-                    test_df[missing_col] = test_df[alt]
-                    found = True
-                    break
+            train_df['mcc_fraud_rate'] = train_df['MCC'].map(mcc_fraud_dict)
+            test_df['mcc_fraud_rate'] = test_df['MCC'].map(mcc_fraud_dict)
+    else:
+        print("Warning: No MCC column found")
+    
+    # ---------- User-based features ----------
+    # User average transaction amount
+    user_stats = train_df.groupby('User')['Amount'].agg(['mean', 'std', 'count']).reset_index()
+    user_stats.columns = ['User', 'user_avg_amount', 'user_std_amount', 'user_txn_count']
+    
+    # Convert to dictionaries for faster mapping
+    user_avg_dict = dict(zip(user_stats['User'], user_stats['user_avg_amount']))
+    user_std_dict = dict(zip(user_stats['User'], user_stats['user_std_amount']))
+    user_count_dict = dict(zip(user_stats['User'], user_stats['user_txn_count']))
+    
+    # Apply mappings
+    train_df['user_avg_amount'] = train_df['User'].map(user_avg_dict)
+    test_df['user_avg_amount'] = test_df['User'].map(user_avg_dict)
+    
+    train_df['user_txn_count'] = train_df['User'].map(user_count_dict)
+    test_df['user_txn_count'] = test_df['User'].map(user_count_dict)
+    
+    # Amount deviation from user average (z-score)
+    # Avoid division by zero
+    train_df['user_std_amount'] = train_df['User'].map(user_std_dict)
+    test_df['user_std_amount'] = test_df['User'].map(user_std_dict)
+    
+    # Replace zero std with median std
+    median_std = train_df['user_std_amount'].median()
+    train_df['user_std_amount'] = train_df['user_std_amount'].replace(0, median_std)
+    test_df['user_std_amount'] = test_df['user_std_amount'].replace(0, median_std)
+    
+    # Calculate z-score
+    train_df['amount_zscore'] = (train_df['Amount'] - train_df['user_avg_amount']) / train_df['user_std_amount']
+    test_df['amount_zscore'] = (test_df['Amount'] - test_df['user_avg_amount']) / test_df['user_std_amount']
+    
+    # ---------- Location-based features ----------
+    # Check if we have location-related columns
+    location_columns = [col for col in train_df.columns if col in 
+                      ['Merchant City', 'Location', 'Merchant State', 'Zip']]
+    
+    if location_columns:
+        # Use the first available location column
+        location_col = location_columns[0]
+        print(f"Using '{location_col}' for location-based features")
+        
+        # Location frequency
+        location_counts = train_df.groupby(location_col)['User'].count().reset_index()
+        location_counts.columns = [location_col, 'location_freq']
+        loc_freq_dict = dict(zip(location_counts[location_col], location_counts['location_freq']))
+        
+        train_df['location_freq'] = train_df[location_col].map(loc_freq_dict)
+        test_df['location_freq'] = test_df[location_col].map(loc_freq_dict)
+        
+        # Fill missing with 0
+        train_df['location_freq'] = train_df['location_freq'].fillna(0)
+        test_df['location_freq'] = test_df['location_freq'].fillna(0)
+        
+        # User-location pairs
+        if len(train_df) < 5000000:  # Only do this for smaller datasets as it's memory intensive
+            user_loc_pairs = train_df.groupby(['User', location_col]).size().reset_index()
+            user_loc_pairs.columns = ['User', location_col, 'user_loc_freq']
+            user_loc_pairs['user_loc_key'] = user_loc_pairs['User'].astype(str) + '_' + user_loc_pairs[location_col].astype(str)
             
-            if not found:
-                print(f"No alternative found for '{missing_col}', creating placeholder")
-                # Create placeholder with unique values per transaction
-                train_df[missing_col] = range(len(train_df))
-                test_df[missing_col] = range(len(train_df), len(train_df) + len(test_df))
-    
-    # 3.1. MCC risk score - mean transaction amount per MCC
-    mcc_risk = train_df.groupby('MCC')['Amount'].mean().to_dict()
-    train_df['mcc_risk_score'] = train_df['MCC'].map(mcc_risk)
-    test_df['mcc_risk_score'] = test_df['MCC'].map(mcc_risk)
-    
-    # Fill missing values with overall mean
-    mean_amount = train_df['Amount'].mean()
-    train_df['mcc_risk_score'] = train_df['mcc_risk_score'].fillna(mean_amount)
-    test_df['mcc_risk_score'] = test_df['mcc_risk_score'].fillna(mean_amount)
-    
-    # 3.2. Merchant frequency
-    merchant_freq = train_df.groupby('Merchant')['User'].count().to_dict()
-    train_df['merchant_freq'] = train_df['Merchant'].map(merchant_freq)
-    test_df['merchant_freq'] = test_df['Merchant'].map(merchant_freq)
-    
-    # Fill with minimum frequency for unseen merchants
-    min_freq = 1
-    train_df['merchant_freq'] = train_df['merchant_freq'].fillna(min_freq)
-    test_df['merchant_freq'] = test_df['merchant_freq'].fillna(min_freq)
-    
-    # 3.3. Online transaction flag
-    train_df['is_online'] = train_df['Merchant'].str.contains('online|web|internet|digital', case=False).astype(int)
-    test_df['is_online'] = test_df['Merchant'].str.contains('online|web|internet|digital', case=False).astype(int)
-    
-    train_df['is_online'] = train_df['is_online'].fillna(0)
-    test_df['is_online'] = test_df['is_online'].fillna(0)
-    
-    # 3.4. Location-based transaction frequency
-    loc_freq = train_df.groupby(['User', 'Location'])['Transaction_ID'].count().reset_index()
-    loc_freq_dict = {}
-    for _, row in loc_freq.iterrows():
-        loc_freq_dict[(row['User'], row['Location'])] = row['Transaction_ID']
-    
-    train_df['location_freq'] = train_df.apply(lambda x: loc_freq_dict.get((x['User'], x['Location']), 0), axis=1)
-    test_df['location_freq'] = test_df.apply(lambda x: loc_freq_dict.get((x['User'], x['Location']), 0), axis=1)
-    
-    # 3.5. Hour-based transaction frequency
-    hour_freq = train_df.groupby(['User', 'hour'])['Transaction_ID'].count().reset_index()
-    hour_freq_dict = {}
-    for _, row in hour_freq.iterrows():
-        hour_freq_dict[(row['User'], row['hour'])] = row['Transaction_ID']
-    
-    train_df['transaction_hour_freq'] = train_df.apply(lambda x: hour_freq_dict.get((x['User'], x['hour']), 0), axis=1)
-    test_df['transaction_hour_freq'] = test_df.apply(lambda x: hour_freq_dict.get((x['User'], x['hour']), 0), axis=1)
-    
-    # 3.6. Fraud rate by merchant category
-    mcc_fraud_rate = train_df.groupby('MCC')['Is_Fraud'].mean().to_dict()
-    train_df['mcc_fraud_rate'] = train_df['MCC'].map(mcc_fraud_rate)
-    test_df['mcc_fraud_rate'] = test_df['MCC'].map(mcc_fraud_rate)
-    
-    # Fill missing with overall fraud rate
-    overall_fraud_rate = train_df['Is_Fraud'].mean()
-    train_df['mcc_fraud_rate'] = train_df['mcc_fraud_rate'].fillna(overall_fraud_rate)
-    test_df['mcc_fraud_rate'] = test_df['mcc_fraud_rate'].fillna(overall_fraud_rate)
-    
-    # 3.7. User average transaction amount
-    user_avg_amount = train_df.groupby('User')['Amount'].mean().to_dict()
-    train_df['user_avg_amount'] = train_df['User'].map(user_avg_amount)
-    test_df['user_avg_amount'] = test_df['User'].map(user_avg_amount)
-    
-    # 3.8. Amount deviation from user average
-    train_df['amount_deviation'] = (train_df['Amount'] - train_df['user_avg_amount']) / (train_df['user_avg_amount'] + 1)
-    test_df['amount_deviation'] = (test_df['Amount'] - test_df['user_avg_amount']) / (test_df['user_avg_amount'] + 1)
+            user_loc_dict = dict(zip(user_loc_pairs['user_loc_key'], user_loc_pairs['user_loc_freq']))
+            
+            # Apply to train set
+            train_df['user_loc_key'] = train_df['User'].astype(str) + '_' + train_df[location_col].astype(str)
+            train_df['user_loc_freq'] = train_df['user_loc_key'].map(user_loc_dict)
+            train_df.drop(columns=['user_loc_key'], inplace=True)
+            
+            # Apply to test set
+            test_df['user_loc_key'] = test_df['User'].astype(str) + '_' + test_df[location_col].astype(str)
+            test_df['user_loc_freq'] = test_df['user_loc_key'].map(user_loc_dict)
+            test_df.drop(columns=['user_loc_key'], inplace=True)
+            
+            # Fill missing with 0
+            train_df['user_loc_freq'] = train_df['user_loc_freq'].fillna(0)
+            test_df['user_loc_freq'] = test_df['user_loc_freq'].fillna(0)
+        else:
+            print("Skipping user-location pairs calculation for large dataset")
+    else:
+        print("Warning: No location columns found")
+        train_df['location_freq'] = 0
+        test_df['location_freq'] = 0
     
     # Handle missing values in all features
     train_df = train_df.fillna(0)
     test_df = test_df.fillna(0)
     
     # 4. Feature Selection
-    print("\n[4] Selecting features for model...")
-    features = [
-        'Amount', 'amount_log', 'hour', 'merchant_freq', 'is_online',
-        'location_freq', 'MCC', 'transaction_hour_freq', 'mcc_risk_score',
-        'mcc_fraud_rate', 'amount_deviation'
+    print("\n[3] Selecting features for model...")
+    # Choose features that exist in the dataframe
+    all_features = [
+        'Amount', 'amount_log', 'hour', 'day_of_week', 'is_weekend',
+        'mcc_avg_amount', 'mcc_count', 'mcc_fraud_rate',
+        'user_avg_amount', 'user_txn_count', 'amount_zscore',
+        'location_freq', 'user_loc_freq'
     ]
     
-    # Verify features exist in the data
-    features = [f for f in features if f in train_df.columns]
+    # Filter to only include features that exist
+    features = [f for f in all_features if f in train_df.columns]
     print(f"Using {len(features)} features: {', '.join(features)}")
     
     # Prepare training and test data
     X_train = train_df[features]
-    y_train = train_df['Is_Fraud']
+    y_train = train_df['is_fraud']
     
     X_test = test_df[features]
-    y_test = test_df['Is_Fraud']
+    y_test = test_df['is_fraud']
     
     # 5. Feature Scaling
-    print("\n[5] Scaling features...")
+    print("\n[4] Scaling features...")
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
     # 6. Model Training
-    print("\n[6] Training XGBoost model...")
+    print("\n[5] Training RandomForest model...")
     
-    # Calculate class weight for imbalance
-    pos_weight = len(y_train[y_train==0]) / max(1, len(y_train[y_train==1]))
-    print(f"Class imbalance ratio (non-fraud to fraud): {pos_weight:.2f}")
+    # Calculate class weights
+    n_samples = len(y_train)
+    n_fraud = y_train.sum()
+    n_normal = n_samples - n_fraud
     
-    # Define model parameters
-    model = XGBClassifier(
-        max_depth=4,
-        learning_rate=0.1,
-        n_estimators=100,
-        scale_pos_weight=pos_weight,
+    # Handle class imbalance
+    class_weight = {
+        0: 1,
+        1: n_normal / max(1, n_fraud)  # Adjust weight for fraud class
+    }
+    print(f"Class imbalance ratio (non-fraud to fraud): {n_normal / max(1, n_fraud):.2f}")
+    
+    # Define model parameters - optimized for memory efficiency
+    model = RandomForestClassifier(
+        n_estimators=50,  # Reduced for memory
+        max_depth=8,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        max_features='sqrt',
+        class_weight=class_weight,
         random_state=42,
-        eval_metric='auc'
+        n_jobs=-1  # Use all available cores
     )
     
-    # Train with early stopping
-    model.fit(
-        X_train_scaled, y_train,
-        eval_set=[(X_test_scaled, y_test)],
-        early_stopping_rounds=20,
-        verbose=False
-    )
-    
-    best_iteration = model.best_iteration
-    print(f"Model trained, best iteration: {best_iteration}")
+    # Train the model
+    print("Training model (this may take a while with large datasets)...")
+    model.fit(X_train_scaled, y_train)
+    print("Model training complete!")
     
     # 7. Make predictions
-    print("\n[7] Making predictions...")
+    print("\n[6] Making predictions...")
     
     # Predict probabilities for ROC and threshold analysis
     y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
@@ -311,7 +374,7 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     y_pred = model.predict(X_test_scaled)
     
     # 8. Evaluation
-    print("\n[8] Evaluating model performance...")
+    print("\n[7] Evaluating model performance...")
     
     # Basic classification report
     cr = classification_report(y_test, y_pred, output_dict=True)
@@ -350,7 +413,7 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     print(cr_optimal_df.round(3))
     
     # 9. Visualizations
-    print("\n[9] Creating visualizations...")
+    print("\n[8] Creating visualizations...")
     
     # 9.1. Confusion Matrix (default threshold)
     plt.figure(figsize=(8, 6))
@@ -404,61 +467,59 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     
     # 9.5. Feature Importance
     plt.figure(figsize=(12, 8))
-    xgb.plot_importance(model, max_num_features=len(features), importance_type='weight')
-    plt.title('Feature Importance (Weight)')
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    plt.title('Feature Importance')
+    plt.bar(range(len(indices)), importances[indices], align='center')
+    plt.xticks(range(len(indices)), [features[i] for i in indices], rotation=90)
     plt.tight_layout()
-    plt.savefig(f'{output_dir}/feature_importance_weight.png')
+    plt.savefig(f'{output_dir}/feature_importance.png')
     plt.close()
     
-    plt.figure(figsize=(12, 8))
-    xgb.plot_importance(model, max_num_features=len(features), importance_type='gain')
-    plt.title('Feature Importance (Gain)')
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/feature_importance_gain.png')
-    plt.close()
+    # 10. Save predictions and metrics
+    print("\n[9] Saving results...")
     
-    # 9.6. Fraud Probability Distribution
-    plt.figure(figsize=(10, 6))
-    sns.histplot(y_pred_proba[y_test == 0], bins=50, alpha=0.5, label='Not Fraud', color='blue')
-    sns.histplot(y_pred_proba[y_test == 1], bins=50, alpha=0.5, label='Fraud', color='red')
-    plt.axvline(x=0.5, color='gray', linestyle='--', label='Default Threshold (0.5)')
-    plt.axvline(x=optimal_threshold, color='green', linestyle='--', 
-                label=f'Optimal Threshold ({optimal_threshold:.4f})')
-    plt.xlabel('Predicted Fraud Probability')
-    plt.ylabel('Count')
-    plt.title('Distribution of Fraud Probabilities')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/fraud_probability_distribution.png')
-    plt.close()
+    # Take a sample of predictions for saving (to avoid memory issues)
+    if len(test_df) > 1000000:
+        print(f"Sampling {1000000:,} predictions for saving...")
+        sample_indices = np.random.choice(len(test_df), size=1000000, replace=False)
+        
+        # Select the test samples
+        test_sample = test_df.iloc[sample_indices].copy()
+        sample_y_test = y_test.iloc[sample_indices]
+        sample_y_pred = y_pred[sample_indices]
+        sample_y_pred_proba = y_pred_proba[sample_indices]
+        sample_y_pred_optimal = y_pred_optimal[sample_indices]
+        
+        # Create prediction dataframe
+        predictions_df = test_sample[['User']].copy()
+        predictions_df['is_fraud'] = sample_y_test
+        predictions_df['predicted_prob'] = sample_y_pred_proba
+        predictions_df['predicted_fraud'] = sample_y_pred
+        predictions_df['predicted_fraud_optimal'] = sample_y_pred_optimal
+    else:
+        # Save all predictions
+        predictions_df = test_df[['User']].copy()
+        predictions_df['is_fraud'] = y_test
+        predictions_df['predicted_prob'] = y_pred_proba
+        predictions_df['predicted_fraud'] = y_pred
+        predictions_df['predicted_fraud_optimal'] = y_pred_optimal
     
-    # 10. Save model and predictions
-    print("\n[10] Saving model and results...")
-    
-    # Save model
-    model_path = f'{output_dir}/fraud_detection_model.json'
-    model.save_model(model_path)
-    print(f"Model saved to {model_path}")
+    # Save predictions
+    predictions_df.to_csv(f'{output_dir}/predictions.csv', index=False)
     
     # Save feature names
     with open(f'{output_dir}/features.json', 'w') as f:
         json.dump(features, f)
     
-    # Save predictions
-    predictions_df = test_df[['User', 'Transaction_ID', 'Is_Fraud']].copy()
-    predictions_df['predicted_prob'] = y_pred_proba
-    predictions_df['predicted_fraud'] = y_pred
-    predictions_df['predicted_fraud_optimal'] = y_pred_optimal
-    predictions_df.to_csv(f'{output_dir}/predictions.csv', index=False)
-    
     # Save metrics
     metrics = {
-        'roc_auc': roc_auc,
+        'roc_auc': float(roc_auc),
         'optimal_threshold': float(optimal_threshold),
         'precision_optimal': float(precision[optimal_idx]),
         'recall_optimal': float(recall[optimal_idx]),
         'f1_optimal': float(f1_scores[optimal_idx]),
-        'class_imbalance_ratio': float(pos_weight),
+        'class_imbalance_ratio': float(n_normal / max(1, n_fraud)),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     
@@ -470,7 +531,7 @@ def run_fraud_detection(data_file='smart_split_data.csv',
     return model, metrics
 
 if __name__ == "__main__":
-    # First run the analysis and data splitting if needed
+    # First check if split dataset exists
     if not os.path.exists('smart_split_data.csv'):
         print("Split dataset not found. Running data analysis and splitting...")
         split_data = analyze_and_split_data(
@@ -479,11 +540,15 @@ if __name__ == "__main__":
             output_split_file='smart_split_data.csv'
         )
     
-    # Run the fraud detection model
+    # Run the fraud detection model with sampling for very large datasets
+    # You can adjust the sample_size parameter based on your system's memory
+    sample_size = 1000000  # Use None to process the entire dataset
+    
     model, metrics = run_fraud_detection(
         data_file='smart_split_data.csv',
         output_dir='fraud_detection_results',
-        use_existing_split=True
+        use_existing_split=True,
+        sample_size=sample_size
     )
     
     print("\nFraud Detection Summary:")
